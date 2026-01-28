@@ -113,6 +113,90 @@ def get_ml_benchmark_function(name: str, seed: int = 0, n_samples: int = 100, n_
         raise ValueError(f"Unknown benchmark: {name}")
 
 
+# ----------------------------
+# Synthetic Benchmark Definitions
+# ----------------------------
+
+def get_synthetic_benchmark_function(name: str, n_dims: int, seed: int = 42):
+    """
+    Factory function to get synthetic objective function and its gradient.
+    
+    Args:
+        name: Name of the benchmark function
+        n_dims: Number of dimensions
+        seed: Random seed for reproducibility (used for some functions)
+    
+    Returns:
+        Tuple of (fn, grad_fn, start_pos)
+        where fn computes the loss, grad_fn computes the gradient,
+        and start_pos is the recommended starting position.
+    """
+    if name == 'sphere':
+        def fn(x):
+            return np.sum(x**2)
+        def grad(x):
+            return 2 * x
+        start_pos = np.full(n_dims, 5.0)
+
+    elif name == 'ellipsoid':
+        c = 10**np.linspace(0, 6, n_dims)
+        def fn(x):
+            return np.sum(c * (x**2))
+        def grad(x):
+            return 2 * c * x
+        start_pos = np.full(n_dims, 5.0)
+
+    elif name == 'rotated_quadratic':
+        rng = np.random.RandomState(seed)
+        M = rng.rand(n_dims, n_dims)
+        Q, _ = np.linalg.qr(M)
+        D = np.diag(10**np.linspace(0, 3, n_dims))
+        A = Q.T @ D @ Q
+        b = rng.rand(n_dims)
+
+        def fn(x):
+            return 0.5 * x.T @ A @ x - b.T @ x
+        def grad(x):
+            return A @ x - b
+        start_pos = np.zeros(n_dims)
+
+    elif name == 'rosenbrock':
+        def fn(x):
+            return np.sum(100.0 * (x[1:] - x[:-1]**2)**2 + (1 - x[:-1])**2)
+        def grad(x):
+            g = np.zeros_like(x)
+            g[:-1] = -400 * x[:-1] * (x[1:] - x[:-1]**2) - 2 * (1 - x[:-1])
+            g[1:] += 200 * (x[1:] - x[:-1]**2)
+            return g
+        start_pos = np.zeros(n_dims)
+
+    elif name == 'rastrigin':
+        def fn(x):
+            return 10 * n_dims + np.sum(x**2 - 10 * np.cos(2 * np.pi * x))
+        def grad(x):
+            return 2 * x + 20 * np.pi * np.sin(2 * np.pi * x)
+        start_pos = np.random.RandomState(seed).uniform(-5.12, 5.12, n_dims)
+
+    elif name == 'ackley':
+        def fn(x):
+            term1 = -20 * np.exp(-0.2 * np.sqrt(np.mean(x**2)))
+            term2 = -np.exp(np.mean(np.cos(2 * np.pi * x)))
+            return term1 + term2 + 20 + np.e
+        def grad(x):
+            s = np.sqrt(np.mean(x**2))
+            if s == 0:
+                return np.zeros_like(x)
+            g1 = -20 * np.exp(-0.2*s) * (-0.2 * (0.5/s) * (2*x/n_dims))
+            g2 = -np.exp(np.mean(np.cos(2*np.pi*x))) * (-2*np.pi/n_dims) * np.sin(2*np.pi*x)
+            return g1 + g2
+        start_pos = np.random.RandomState(seed).uniform(-32.7, 32.7, n_dims)
+
+    else:
+        raise ValueError(f"Unknown synthetic benchmark: {name}")
+
+    return fn, grad, start_pos
+
+
 def evaluate_ml_pipeline(optimizer_cls, learning_rate, benchmark_name='linear_regression', 
                         n_steps=500, seed=0, n_samples=100, n_dims=5, weight_decay=0.0):
     """
@@ -129,7 +213,8 @@ def evaluate_ml_pipeline(optimizer_cls, learning_rate, benchmark_name='linear_re
         weight_decay: Weight decay (L2 regularization) coefficient
     
     Returns:
-        Tuple of (final_loss, loss_history)
+        Tuple of (final_loss, loss_history, incumbent_history)
+        incumbent_history tracks the best loss seen so far at each step
     """
     loss_fn, params, description = get_ml_benchmark_function(benchmark_name, seed=seed, 
                                                              n_samples=n_samples, n_dims=n_dims)
@@ -138,95 +223,193 @@ def evaluate_ml_pipeline(optimizer_cls, learning_rate, benchmark_name='linear_re
     opt = optimizer_cls(params, lr=learning_rate, weight_decay=weight_decay)
     
     loss_history = []
+    incumbent_history = []
+    best_loss = float('inf')
     
     for step in range(n_steps):
         opt.zero_grad()
         loss = loss_fn()
         loss.backward()
         opt.step()
-        loss_history.append(float(loss.item()))
+        
+        current_loss = float(loss.item())
+        loss_history.append(current_loss)
+        
+        # Track incumbent (best loss so far)
+        if current_loss < best_loss:
+            best_loss = current_loss
+        incumbent_history.append(best_loss)
     
     # Final loss
     with torch.no_grad():
         final_loss = float(loss_fn().item())
     
-    return final_loss, loss_history
+    return final_loss, loss_history, incumbent_history
 
-def run_optimizer_on_benchmarks(opt_info):
+def evaluate_synthetic_pipeline(optimizer_cls, learning_rate, benchmark_name='sphere',
+                               n_dims=10, n_steps=500, seed=42, weight_decay=0.0):
     """
-    Helper function to run an optimizer on all benchmarks.
+    Evaluate an optimizer on a synthetic benchmark function.
     
     Args:
-    opt_info: Dict with keys 'name', 'creator', 'type', 'opt', 'idx', 'lr'
+        optimizer_cls: Optimizer class or creator
+        learning_rate: Learning rate for the optimizer
+        benchmark_name: Name of the synthetic benchmark
+        n_dims: Number of dimensions
+        n_steps: Number of optimization steps
+        seed: Random seed for reproducibility
+        weight_decay: Weight decay (L2 regularization) coefficient
     
     Returns:
-    Dict with optimizer results
+        Tuple of (final_loss, loss_history, incumbent_history)
+        incumbent_history tracks the best loss seen so far at each step
     """
-    lr_float = opt_info['lr']
-    lr_float = float(lr_float) if isinstance(lr_float, (int, float, np.floating)) else str(lr_float)
-    results = {
-        'optimizer_idx': opt_info['idx'],
-        'learning_rate': lr_float,
-        'optimizer_info': opt_info['name'],
-        'optimizer_type': opt_info['type'],
-        'opt': opt_info['opt'],
-        'benchmarks': {}
-    }
+    # Get benchmark function and starting position
+    fn, grad_fn, start_pos = get_synthetic_benchmark_function(benchmark_name, n_dims, seed)
     
-    for benchmark_name in benchmarks:
-        prefix = f"[{opt_info['type']}:{opt_info.get('name', '')}]"
-        print(f"\n  {prefix} Benchmark: {benchmark_name}".strip())
+    # Create parameter as torch tensor
+    x = torch.nn.Parameter(torch.from_numpy(start_pos).float(), requires_grad=True)
+    opt = optimizer_cls([x], lr=learning_rate, weight_decay=weight_decay)
+    
+    loss_history = []
+    incumbent_history = []
+    best_loss = float('inf')
+
+    for step in range(n_steps):
+        opt.zero_grad()
+
+        # Compute loss and gradient using numpy functions
+        x_np = x.detach().numpy()
+        loss_value = fn(x_np)
+        loss_history.append(float(loss_value))
+        
+        # Track incumbent (best loss so far)
+        if loss_value < best_loss:
+            best_loss = loss_value
+        incumbent_history.append(best_loss)
+
+        # Compute gradient and assign to parameter
+        grad_np = grad_fn(x_np)
+        x.grad = torch.from_numpy(grad_np).float()
+        opt.step()
+
+    # Final loss
+    final_x_np = x.detach().numpy()
+    final_loss = fn(final_x_np)
+
+    return final_loss, loss_history, incumbent_history
+
+def run_single_optimizer(opt_creator, learning_rate, optimizer_name, benchmark_name, 
+                        n_steps, seed, n_samples, n_dims, weight_decay, output_dir):
+    """
+    Run a single optimizer on a benchmark and save results.
+    
+    Args:
+        opt_creator: Function to create optimizer
+        learning_rate: Learning rate
+        optimizer_name: Name identifier for the optimizer
+        benchmark_name: Name of the benchmark
+        n_steps: Number of optimization steps
+        seed: Random seed
+        n_samples: Number of data samples (for ML tasks, ignored for synthetic)
+        n_dims: Number of input dimensions
+        weight_decay: Weight decay coefficient
+        output_dir: Directory to save results
+    
+    Returns:
+        Dict with final_loss and incumbent_history
+    """
+    print(f"  Running {optimizer_name} (lr={learning_rate:.6e})...")
+    
+    # List of synthetic benchmarks
+    synthetic_benchmarks = ['sphere', 'ellipsoid', 'rotated_quadratic', 'rosenbrock', 'rastrigin', 'ackley']
+    is_synthetic = benchmark_name in synthetic_benchmarks
     
     try:
-        final_loss, loss_history = evaluate_ml_pipeline(
-            optimizer_cls=opt_info['creator'],
-            learning_rate=lr_float,
-            benchmark_name=benchmark_name,
-            n_steps=n_steps,
-            seed=seed,
-            n_samples=n_samples,
-            n_dims=n_dims,
-            weight_decay=weight_decay
-        )
+        if is_synthetic:
+            # Use synthetic evaluation
+            final_loss, loss_history, incumbent_history = evaluate_synthetic_pipeline(
+                optimizer_cls=opt_creator,
+                learning_rate=learning_rate,
+                benchmark_name=benchmark_name,
+                n_dims=n_dims,
+                n_steps=n_steps,
+                seed=seed,
+                weight_decay=weight_decay
+            )
+        else:
+            # Use ML evaluation
+            final_loss, loss_history, incumbent_history = evaluate_ml_pipeline(
+                optimizer_cls=opt_creator,
+                learning_rate=learning_rate,
+                benchmark_name=benchmark_name,
+                n_steps=n_steps,
+                seed=seed,
+                n_samples=n_samples,
+                n_dims=n_dims,
+                weight_decay=weight_decay
+            )
         
-        results['benchmarks'][benchmark_name] = {
+        # Save results
+        result_data = {
+            'optimizer': optimizer_name,
+            'benchmark': benchmark_name,
+            'benchmark_type': 'synthetic' if is_synthetic else 'ml',
+            'seed': seed,
+            'learning_rate': float(learning_rate),
+            'n_steps': n_steps,
+            'n_dims': n_dims,
+            'weight_decay': weight_decay,
             'final_loss': float(final_loss),
-            'loss_history': [float(l) for l in loss_history]
+            'incumbent_history': [float(x) for x in incumbent_history],
+            'loss_history': [float(x) for x in loss_history]
         }
         
-        # Compute best loss for this specific optimizer type and name
-        best_loss = float(final_loss)
-        for prev in all_results['optimizers']:
-            # Only compare with same optimizer type and name
-            if (prev.get('optimizer_type') == opt_info['type'] and prev.get('opt') == opt_info['opt']):
-                prev_benchmarks = prev.get('benchmarks', {})
-                prev_entry = prev_benchmarks.get(benchmark_name)
-                if prev_entry and 'final_loss' in prev_entry:
-                    try:
-                        prev_loss = float(prev_entry['final_loss'])
-                        if prev_loss < best_loss:
-                            best_loss = prev_loss
-                    except Exception:
-                        continue
-        print(f"    final_loss={final_loss:.6e}  best_so_far={best_loss:.6e}")
+        if not is_synthetic:
+            result_data['n_samples'] = n_samples
+        
+        output_file = output_dir / f"{optimizer_name}_{seed}.json"
+        with open(output_file, 'w') as f:
+            json.dump(result_data, f, indent=2)
+        
+        print(f"    Final loss: {final_loss:.6e} -> Saved to {output_file.name}")
+        
+        return result_data
     
     except Exception as e:
-        print(f"    ERROR - {str(e)}")
-        results['benchmarks'][benchmark_name] = {
+        print(f"    ERROR: {str(e)}")
+        result_data = {
+            'optimizer': optimizer_name,
+            'benchmark': benchmark_name,
+            'benchmark_type': 'synthetic' if is_synthetic else 'ml',
+            'seed': seed,
+            'error': str(e),
             'final_loss': float('inf'),
-            'loss_history': [],
-            'error': str(e)
+            'incumbent_history': []
         }
-    
-    return results
+        return result_data
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run optimizer benchmarks on ML tasks.")
+    parser = argparse.ArgumentParser(description="Run optimizer benchmarks on ML tasks and synthetic functions.")
     parser.add_argument(
-        "--benchmarks",
-        nargs="+",
-        default=['linear_regression', 'logistic_regression', 'xor_mlp', 'autoencoder'],
-        help="List of ML benchmark names (space separated)."
+        "--benchmark",
+        type=str,
+        default='linear_regression',
+        choices=[
+            # ML benchmarks
+            'linear_regression', 'logistic_regression', 'xor_mlp', 'autoencoder',
+            # Synthetic benchmarks
+            'sphere', 'ellipsoid', 'rotated_quadratic', 'rosenbrock', 'rastrigin', 'ackley'
+        ],
+        help="Benchmark name (ML task or synthetic function)."
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default='RS',
+        choices=['RS', 'RE'],
+        help="Optimizer type: RS (random search) or RE (regularized evolution)."
     )
     parser.add_argument(
         "--n_optimizer_samples",
@@ -250,19 +433,19 @@ if __name__ == "__main__":
         "--seed",
         type=int,
         default=0,
-        help="Random seed for benchmark data generation."
+        help="Random seed for benchmark data generation and optimizer sampling."
     )
     parser.add_argument(
         "--n_samples",
         type=int,
         default=100,
-        help="Number of data samples (for regression/classification tasks)."
+        help="Number of data samples (for ML benchmarks only, ignored for synthetic functions)."
     )
     parser.add_argument(
         "--n_dims",
         type=int,
         default=5,
-        help="Number of input dimensions/features."
+        help="Number of input dimensions/features. For ML: feature dimension. For synthetic: problem dimension."
     )
     parser.add_argument(
         "--weight_decay",
@@ -273,7 +456,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    benchmarks = args.benchmarks
+    benchmark = args.benchmark
+    optimizer_type = args.optimizer
     n_optimizer_samples = args.n_optimizer_samples
     n_steps = args.n_steps
     seed = args.seed
@@ -281,159 +465,142 @@ if __name__ == "__main__":
     n_dims = args.n_dims
     weight_decay = args.weight_decay
 
-    results_dir = Path(args.results_dir)
-    results_dir.mkdir(exist_ok=True)
+    # Set random seeds for reproducibility
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    # Store all results across all sampled optimizers
-    all_results = {
-        'n_optimizer_samples': n_optimizer_samples,
-        'n_steps': n_steps,
-        'seed': seed,
-        'n_samples': n_samples,
-        'n_dims': n_dims,
-        'weight_decay': weight_decay,
-        'benchmarks_list': benchmarks,
-        'optimizers': []
-    }
+    results_dir = Path(args.results_dir)
+    benchmark_dir = results_dir / benchmark
+    benchmark_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"Running benchmark: {benchmark}")
+    print(f"Optimizer type: {optimizer_type}")
+    print(f"Seed: {seed}")
+    print(f"{'='*60}\n")
 
     space = NOSSpaceMaxLines(max_lines=10)
-    # RS
+    
+    # Initialize samplers and trials for RE
     random_sampler = sampling.RandomSampler({})
     prior_sampler = sampling.PriorOrFallbackSampler(random_sampler)
-    # RE
-    trials = {}
+    trials = {} if optimizer_type == 'RE' else None
 
     for optimizer_idx in range(n_optimizer_samples):
         print(f"\n{'='*60}")
         print(f"Optimizer Sample {optimizer_idx + 1}/{n_optimizer_samples}")
         print(f"{'='*60}")
 
-        # Sample optimizer and learning rate
-        resolved_pipeline, resolution_context = neps_space.resolve(space, domain_sampler=prior_sampler)
-        optimizer_creator_object_rs = resolved_pipeline.optimizer_cls
-        learning_rate_rs = resolved_pipeline.learning_rate
-        optimizer_creator_rs = neps_space.convert_operation_to_callable(optimizer_creator_object_rs)
-
-        # Sample with RE too #############
-        config = neps.algorithms.neps_regularized_evolution(NOSSpaceMaxLines(), population_size=20, tournament_size=5)(trials, None)
-        assert not isinstance(config, list)
-        samplings = neps_space.NepsCompatConverter().from_neps_config(config.config).predefined_samplings
-
-        resolved_pipeline, resolution_context = neps_space.resolve(
-            space, domain_sampler=sampling.OnlyPredefinedValuesSampler(predefined_samplings=samplings)
-        )
-        optimizer_creator_object_re = (resolved_pipeline.optimizer_cls) 
-        learning_rate_re = resolved_pipeline.learning_rate  # Extract the learning rate
-        optimizer_creator_re = neps_space.convert_operation_to_callable(optimizer_creator_object_re) 
-
-        ###################################
-
-        print(f"\nLearning rate: {learning_rate_rs} (RS), {learning_rate_re} (RE)")
-
-        # Run NEPS optimizer
-        def neps_opt_wrapper(params, lr, weight_decay=0.0, type='RS'):
-            if type == 'RE':
-                return optimizer_creator_re(params, lr=lr, variables=(1, 1))
-            elif type == 'RS':
-                return optimizer_creator_rs(params, lr=lr, variables=(1, 1))
-        
-        for neps_name in ['RS', 'RE']:
-            neps_creator = partial(neps_opt_wrapper, type=neps_name)
-            lr_float = learning_rate_rs if neps_name == 'RS' else learning_rate_re
-            optimizer_creator_object = optimizer_creator_object_rs if neps_name == 'RS' else optimizer_creator_object_re
-            neps_info = {
-                'name': str(optimizer_creator_object),
-                'creator': neps_creator,
-                'type': 'neps',
-                'opt': neps_name,
-                'idx': optimizer_idx,
-                'lr': lr_float
-            }
-        
-            optimizer_results = run_optimizer_on_benchmarks(neps_info)
-            all_results['optimizers'].append(optimizer_results)
-
-            if neps_name == 'RE':
-                score = optimizer_results['benchmarks'][benchmarks[0]]['final_loss']
-                new_trial = Trial(
-                    config=config.config, 
-                    metadata=trial.MetaData(
-                        id=str(optimizer_idx), 
-                        location="", 
-                        state=None, 
-                        previous_trial_id=None, 
-                        previous_trial_location=None, 
-                        sampling_worker_id="", 
-                        time_sampled=optimizer_idx, 
-                        time_end=optimizer_idx
-                        ), 
-                        report=trial.Report(
-                            objective_to_minimize=score, 
-                            cost=None, learning_curve=None, 
-                            extra={}, err=None, tb=None, 
-                            reported_as=trial.State.SUCCESS, 
-                            evaluation_duration=0
-                        )
-                )
-
-                trials[str(optimizer_idx)] = new_trial
-        
-        # Run baseline optimizers
-        baseline_optimizers = {
-            'Adam': lambda params, lr, weight_decay: optim.Adam(params, lr=lr, weight_decay=weight_decay),
-            'AdamW': lambda params, lr, weight_decay: optim.AdamW(params, lr=lr, weight_decay=weight_decay),
-            'SGD': lambda params, lr, weight_decay: optim.SGD(params, lr=lr, weight_decay=weight_decay)
-        }
-        
-        for base_name, base_creator in baseline_optimizers.items():
-            baseline_info = {
-                'name': f'{base_name}',
-                'creator': lambda params, lr, weight_decay=weight_decay: base_creator(params, lr, weight_decay),
-                'type': 'baseline',
-                'opt': base_name,
-                'idx': optimizer_idx,
-                'lr': lr_float
+        if optimizer_type == 'RS':
+            # Random Search: Sample optimizer and learning rate
+            resolved_pipeline, resolution_context = neps_space.resolve(space, domain_sampler=prior_sampler)
+            optimizer_creator_object = resolved_pipeline.optimizer_cls
+            learning_rate = resolved_pipeline.learning_rate
+            optimizer_creator = neps_space.convert_operation_to_callable(optimizer_creator_object)
+            
+            print(f"Learning rate: {learning_rate}")
+            
+            # Run NEPS RS optimizer
+            def neps_opt_wrapper(params, lr, weight_decay=0.0):
+                return optimizer_creator(params, lr=lr, variables=(1, 1))
+            
+            neps_creator = partial(neps_opt_wrapper)
+            run_single_optimizer(
+                opt_creator=neps_creator,
+                learning_rate=learning_rate,
+                optimizer_name='RS',
+                benchmark_name=benchmark,
+                n_steps=n_steps,
+                seed=seed,
+                n_samples=n_samples,
+                n_dims=n_dims,
+                weight_decay=weight_decay,
+                output_dir=benchmark_dir
+            )
+            
+            # Run baseline optimizers with the same learning rate
+            baseline_optimizers = {
+                'Adam': lambda params, lr, weight_decay: optim.Adam(params, lr=lr, weight_decay=weight_decay),
+                'AdamW': lambda params, lr, weight_decay: optim.AdamW(params, lr=lr, weight_decay=weight_decay),
+                'SGD': lambda params, lr, weight_decay: optim.SGD(params, lr=lr, weight_decay=weight_decay)
             }
             
-            baseline_results = run_optimizer_on_benchmarks(baseline_info)
-            all_results['optimizers'].append(baseline_results)
+            for base_name, base_creator in baseline_optimizers.items():
+                baseline_creator = lambda params, lr, weight_decay=weight_decay: base_creator(params, lr, weight_decay)
+                run_single_optimizer(
+                    opt_creator=baseline_creator,
+                    learning_rate=learning_rate,
+                    optimizer_name=base_name,
+                    benchmark_name=benchmark,
+                    n_steps=n_steps,
+                    seed=seed,
+                    n_samples=n_samples,
+                    n_dims=n_dims,
+                    weight_decay=weight_decay,
+                    output_dir=benchmark_dir
+                )
+        
+        elif optimizer_type == 'RE':
+            # Regularized Evolution: Sample using NEPS RE algorithm
+            config = neps.algorithms.neps_regularized_evolution(NOSSpaceMaxLines(), population_size=20, tournament_size=5)(trials, None)
+            assert not isinstance(config, list)
+            samplings = neps_space.NepsCompatConverter().from_neps_config(config.config).predefined_samplings
 
+            resolved_pipeline, resolution_context = neps_space.resolve(
+                space, domain_sampler=sampling.OnlyPredefinedValuesSampler(predefined_samplings=samplings)
+            )
+            optimizer_creator_object = resolved_pipeline.optimizer_cls
+            learning_rate = resolved_pipeline.learning_rate
+            optimizer_creator = neps_space.convert_operation_to_callable(optimizer_creator_object)
+            
+            print(f"Learning rate: {learning_rate}")
+            
+            # Run NEPS RE optimizer
+            def neps_opt_wrapper(params, lr, weight_decay=0.0):
+                return optimizer_creator(params, lr=lr, variables=(1, 1))
+            
+            neps_creator = partial(neps_opt_wrapper)
+            result = run_single_optimizer(
+                opt_creator=neps_creator,
+                learning_rate=learning_rate,
+                optimizer_name='RE',
+                benchmark_name=benchmark,
+                n_steps=n_steps,
+                seed=seed,
+                n_samples=n_samples,
+                n_dims=n_dims,
+                weight_decay=weight_decay,
+                output_dir=benchmark_dir
+            )
+            
+            # Update trials for RE
+            score = result['final_loss']
+            new_trial = Trial(
+                config=config.config, 
+                metadata=trial.MetaData(
+                    id=str(optimizer_idx), 
+                    location="", 
+                    state=None, 
+                    previous_trial_id=None, 
+                    previous_trial_location=None, 
+                    sampling_worker_id="", 
+                    time_sampled=optimizer_idx, 
+                    time_end=optimizer_idx
+                ), 
+                report=trial.Report(
+                    objective_to_minimize=score, 
+                    cost=None, 
+                    learning_curve=None, 
+                    extra={}, 
+                    err=None, 
+                    tb=None, 
+                    reported_as=trial.State.SUCCESS, 
+                    evaluation_duration=0
+                )
+            )
+            trials[str(optimizer_idx)] = new_trial
 
-    # Save all results to a single JSON file
-    output_file = results_dir / "all_results.json"
-    with open(output_file, 'w') as f:
-        json.dump(all_results, f, indent=2)
-    
     print(f"\n{'='*60}")
-    print(f"All results saved to {output_file}")
-
-    # Compute and print the overall best optimizer entry (smallest final_loss)
-    best = {'loss': float('inf'), 'optimizer': None, 'benchmark': None}
-    for opt in all_results.get('optimizers', []):
-        bench_map = opt.get('benchmarks', {})
-        for bench_name, entry in bench_map.items():
-            try:
-                val = float(entry.get('final_loss', float('inf')))
-            except Exception:
-                continue
-            if val < best['loss']:
-                best['loss'] = val
-                best['optimizer'] = opt
-                best['benchmark'] = bench_name
-
-    if best['optimizer'] is not None:
-        opt = best['optimizer']
-        info = opt.get('optimizer_info')
-        otype = opt.get('optimizer_type', 'unknown')
-        idx = opt.get('optimizer_idx')
-        bname = opt.get('opt')
-        print(f"Best optimizer found -> final_loss={best['loss']:.6e}")
-        print(f"  optimizer_idx: {idx}")
-        print(f"  optimizer_type: {otype}")
-        print(f"  optimizer_name: {bname}")
-        print(f"  optimizer_info: {info}")
-        print(f"  benchmark: {best['benchmark']}")
-    else:
-        print('No valid optimizer results found to determine best optimizer')
-
+    print(f"All results saved to {benchmark_dir}")
     print(f"{'='*60}")
+
