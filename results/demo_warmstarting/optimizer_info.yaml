@@ -1,0 +1,9 @@
+info:
+  ignore_fidelity: false
+  mutation_type: 0.5
+  n_forgets: null
+  n_mutations: random
+  population_size: 20
+  tournament_size: 5
+  use_priors: true
+name: neps_regularized_evolution

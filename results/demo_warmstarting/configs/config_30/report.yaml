@@ -1,0 +1,9 @@
+cost: null
+err: null
+evaluation_duration: 0.0008878330700099468
+extra: {}
+learning_curve:
+- 8.850815773010254
+objective_to_minimize: 8.850815773010254
+reported_as: success
+tb: null
